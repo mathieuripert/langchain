@@ -2,7 +2,7 @@ defmodule LangChain.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/brainlid/langchain"
-  @version "0.4.0-rc.0"
+  @version "0.4.0-rc.1"
 
   def project do
     [
@@ -37,7 +37,7 @@ defmodule LangChain.MixProject do
   defp deps do
     [
       {:ecto, "~> 3.10 or ~> 3.11"},
-      {:gettext, "~> 0.20"},
+      {:gettext, "~> 0.26"},
       {:req, ">= 0.5.2"},
       {:nimble_parsec, "~> 1.4", optional: true},
       {:abacus, "~> 2.1.0", optional: true},

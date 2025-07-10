@@ -4,9 +4,10 @@ defmodule LangChain.Chains.LLMChain do
 
   The chain deals with tools, a tool map, delta tracking, tracking the messages
   exchanged during a run, the last_message tracking, conversation messages, and
-  verbose logging. This helps by separating these responsibilities from the LLM
-  making it easier to support additional LLMs because the focus is on
-  communication and formats instead of all the extra logic.
+  verbose logging. Messages and tool results support multi-modal ContentParts,
+  enabling richer responses (text, images, files, thinking, etc.). ToolResult
+  content can be a list of ContentParts. The chain also supports
+  `async_tool_timeout` and improved fallback handling.
 
   ## Callbacks
 
@@ -756,13 +757,23 @@ defmodule LangChain.Chains.LLMChain do
     # wrap and link the model's callbacks.
     use_llm = Utils.rewrap_callbacks_for_model(chain.llm, chain.callbacks, chain)
 
+    # filter out any empty lists in the list of messages.
+    message_response =
+      case module.call(use_llm, chain.messages, chain.tools) do
+        {:ok, messages} when is_list(messages) ->
+          {:ok, Enum.reject(messages, &(&1 == []))}
+
+        non_list_or_error ->
+          non_list_or_error
+      end
+
     # handle and output response
-    case module.call(use_llm, chain.messages, chain.tools) do
+    case message_response do
       {:ok, [%Message{} = message]} ->
         if chain.verbose, do: IO.inspect(message, label: "SINGLE MESSAGE RESPONSE")
         {:ok, process_message(chain, message)}
 
-      {:ok, [%Message{} = message, _others] = messages} ->
+      {:ok, [%Message{} = message | _others] = messages} ->
         if chain.verbose, do: IO.inspect(messages, label: "MULTIPLE MESSAGE RESPONSE")
         # return the list of message responses. Happens when multiple
         # "choices" are returned from LLM by request.
@@ -847,20 +858,59 @@ defmodule LangChain.Chains.LLMChain do
   end
 
   @doc """
-  Apply a received MessageDelta struct to the chain. The LLMChain tracks the
-  current merged MessageDelta state. When the final delta is received that
+  Apply a list of deltas to the chain. When the final delta is received that
   completes the message, the LLMChain is updated to clear the `delta` and the
-  `last_message` and list of messages are updated.
+  `last_message` and list of messages are updated. The message is processed and
+  fires any registered callbacks.
   """
-  @spec apply_delta(t(), MessageDelta.t() | {:error, LangChainError.t()}) :: t()
-  def apply_delta(%LLMChain{} = chain, %MessageDelta{} = new_delta) do
+  @spec apply_deltas(t(), list()) :: t()
+  def apply_deltas(%LLMChain{} = chain, deltas) when is_list(deltas) do
+    chain
+    |> merge_deltas(deltas)
+    |> delta_to_message_when_complete()
+  end
+
+  @doc """
+  Merge a list of deltas into the chain.
+  """
+  @spec merge_deltas(t(), list()) :: t()
+  def merge_deltas(%LLMChain{} = chain, deltas) do
+    deltas
+    |> List.flatten()
+    |> Enum.reduce(chain, fn d, acc -> merge_delta(acc, d) end)
+  end
+
+  @doc """
+  Merge a received MessageDelta struct into the chain's current delta. The
+  LLMChain tracks the current merged MessageDelta state. This is able to merge
+  in TokenUsage received after the final delta.
+  """
+  @spec merge_delta(t(), MessageDelta.t() | TokenUsage.t() | {:error, LangChainError.t()}) :: t()
+  def merge_delta(%LLMChain{} = chain, %MessageDelta{} = new_delta) do
     merged = MessageDelta.merge_delta(chain.delta, new_delta)
-    delta_to_message_when_complete(%LLMChain{chain | delta: merged})
+    %LLMChain{chain | delta: merged}
+  end
+
+  def merge_delta(%LLMChain{} = chain, %TokenUsage{} = usage) do
+    # OpenAI returns the token usage in a separate chunk after the last delta. We want to merge it into the final delta.
+    fake_delta = MessageDelta.new!(%{role: :assistant, metadata: %{usage: usage}})
+
+    merged = MessageDelta.merge_delta(chain.delta, fake_delta)
+    %LLMChain{chain | delta: merged}
   end
 
   # Handle when the server is overloaded and cancelled the stream on the server side.
-  def apply_delta(%LLMChain{} = chain, {:error, %LangChainError{type: "overloaded"}}) do
+  def merge_delta(%LLMChain{} = chain, {:error, %LangChainError{type: "overloaded"}}) do
     cancel_delta(chain, :cancelled)
+  end
+
+  @doc """
+  Drop the current delta. This is useful when needing to ignore a partial or
+  complete delta because the message may be handled in a different way.
+  """
+  @spec drop_delta(t()) :: t()
+  def drop_delta(%LLMChain{} = chain) do
+    %LLMChain{chain | delta: nil}
   end
 
   @doc """
@@ -889,16 +939,6 @@ defmodule LangChain.Chains.LLMChain do
   def delta_to_message_when_complete(%LLMChain{} = chain) do
     # either no delta or incomplete
     chain
-  end
-
-  @doc """
-  Apply a list of deltas to the chain.
-  """
-  @spec apply_deltas(t(), list()) :: t()
-  def apply_deltas(%LLMChain{} = chain, deltas) when is_list(deltas) do
-    deltas
-    |> List.flatten()
-    |> Enum.reduce(chain, fn d, acc -> apply_delta(acc, d) end)
   end
 
   # Process an assistant message sequentially through each message processor.
@@ -1158,6 +1198,17 @@ defmodule LangChain.Chains.LLMChain do
         if verbose, do: IO.inspect(function.name, label: "EXECUTING FUNCTION")
 
         case Function.execute(function, call.arguments, context) do
+          {:ok, %ToolResult{} = result} ->
+            # allow the tool execution to return a ToolResult. Just set the
+            # tool_call_id and fallback settings for name and display_text. This
+            # allows the tool to explicitly set the options for the ToolResult.
+            %{
+              result
+              | tool_call_id: call.call_id,
+                name: result.name || function.name,
+                display_text: result.display_text || function.display_text
+            }
+
           {:ok, llm_result, processed_result} ->
             if verbose, do: IO.inspect(processed_result, label: "FUNCTION PROCESSED RESULT")
             # successful execution and storage of processed_content.

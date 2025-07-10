@@ -76,7 +76,7 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
 
     # The version of the API to use.
     field :api_version, :string, default: @default_api_version
-    field :model, :string, default: "gemini-pro"
+    field :model, :string, default: "gemini-2.5-pro"
     field :api_key, :string, redact: true
 
     # What sampling temperature to use, between 0 and 2. Higher values like 0.8
@@ -118,6 +118,9 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
 
     # A list of maps for callback handlers (treat as private)
     field :callbacks, {:array, :map}, default: []
+
+    # Additional level of raw api request and response data
+    field :verbose_api, :boolean, default: false
   end
 
   @type t :: %ChatGoogleAI{}
@@ -358,14 +361,17 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
 
   def for_api(%ToolResult{} = result) do
     content =
-      case Jason.decode(result.content) do
+      result.content
+      |> ContentPart.parts_to_string()
+      |> Jason.decode()
+      |> case do
         {:ok, data} ->
           # content was converted through JSON
           data
 
         {:error, %Jason.DecodeError{}} ->
           # assume the result is intended to be a string and return it as-is
-          result.content
+          %{"result" => result.content}
       end
 
     # There is no explanation for why they want it nested like this. Odd.
@@ -762,9 +768,9 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
     end
   end
 
-  def do_process_response(_model, %{"error" => %{"message" => reason}}, _) do
+  def do_process_response(_model, %{"error" => %{"message" => reason}} = response, _) do
     Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, LangChainError.exception(message: reason)}
+    {:error, LangChainError.exception(message: reason, original: response)}
   end
 
   def do_process_response(_model, {:error, %Jason.DecodeError{} = response}, _) do
@@ -779,7 +785,11 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
     Logger.error("Trying to process an unexpected response. #{inspect(other)}")
 
     {:error,
-     LangChainError.exception(type: "unexpected_response", message: "Unexpected response")}
+     LangChainError.exception(
+       type: "unexpected_response",
+       message: "Unexpected response",
+       original: other
+     )}
   end
 
   @doc false

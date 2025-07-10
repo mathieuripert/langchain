@@ -134,6 +134,56 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       })
 
   As of the documentation for Claude 3.7 Sonnet, the minimum budget for thinking is 1024 tokens.
+
+  ## Prompt Caching
+
+  Anthropic supports [prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) to
+  reduce costs and latency for frequently repeated content. Prompt caching works by caching large blocks of
+  content that are likely to be reused across multiple requests.
+
+  Prompt caching is configured through the `cache_control` option in `ContentPart` options. It can be applied
+  to both system messages, regular user messages, tool results, and tool definitions.
+
+  Anthropic limits a conversation to max of 4 cache_control blocks and will refuse to service requests with more.
+
+  ### Basic Usage
+
+  Setting `cache_control: true` is a shortcut for the default ephemeral cache control:
+
+      # System message with caching
+      Message.new_system!([
+        ContentPart.text!("You are an AI assistant analyzing literary works."),
+        ContentPart.text!("<large document content>", cache_control: true)
+      ])
+
+      # User message with caching
+      Message.new_user!([
+        ContentPart.text!("Please analyze this document:"),
+        ContentPart.text!("<large document content>", cache_control: true)
+      ])
+
+  ### Advanced Cache Control
+
+  For more explicit control over caching parameters, you can provide a map instead of `true`:
+
+      ContentPart.text!("content", cache_control: %{"type" => "ephemeral", "ttl" => "1h"})
+
+  When `cache_control: true` is used, it automatically expands to `%{"type" => "ephemeral"}` in the API request.
+  If you need specific cache control settings like TTL, providing them explicitly preserves the exact values
+  sent to the API.
+
+  The default is "5m" for 5 minutes but supports "1h" for 1 hour depending on your account.
+
+
+  ### Supported Content Types
+
+  Prompt caching can be applied to:
+  - Text content in system messages
+  - Text content in user messages
+  - Tool results in the `content` field when returning a list of `ContentPart` structs.
+  - Tool definitions in the `options` field when creating a `Function` struct.
+
+  For more information, see the [Anthropic prompt caching documentation](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching).
   """
   use Ecto.Schema
   require Logger
@@ -365,7 +415,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   defp get_tools_for_api(tools) do
     Enum.map(tools, fn
       %Function{} = function ->
-        for_api(function)
+        function_for_api(function)
     end)
   end
 
@@ -502,6 +552,21 @@ defmodule LangChain.ChatModels.ChatAnthropic do
             result
         end
 
+      {:ok, %Req.Response{status: 429} = response} ->
+        rate_limit_info = get_ratelimit_info(response.headers)
+
+        Callbacks.fire(anthropic.callbacks, :on_llm_ratelimit_info, [
+          rate_limit_info
+        ])
+
+        # Rate limit exceeded
+        {:error,
+         LangChainError.exception(
+           type: "rate_limit_exceeded",
+           message: "Rate limit exceeded",
+           original: rate_limit_info
+         )}
+
       {:ok, %Req.Response{status: 529}} ->
         {:error, LangChainError.exception(type: "overloaded", message: "Overloaded")}
 
@@ -548,7 +613,8 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       json: raw_data,
       headers: headers(anthropic),
       receive_timeout: anthropic.receive_timeout,
-      aws_sigv4: aws_sigv4_opts(anthropic.bedrock)
+      aws_sigv4: aws_sigv4_opts(anthropic.bedrock),
+      retry: :transient
     )
     |> Req.post(
       into:
@@ -847,17 +913,20 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     |> to_response()
   end
 
-  def do_process_response(_model, %{
-        "type" => "error",
-        "error" => %{"type" => type, "message" => reason}
-      }) do
+  def do_process_response(
+        _model,
+        %{
+          "type" => "error",
+          "error" => %{"type" => type, "message" => reason}
+        } = response
+      ) do
     Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, LangChainError.exception(type: type, message: reason)}
+    {:error, LangChainError.exception(type: type, message: reason, original: response)}
   end
 
-  def do_process_response(_model, %{"error" => %{"message" => reason} = error}) do
+  def do_process_response(_model, %{"error" => %{"message" => reason} = error} = response) do
     Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, LangChainError.exception(type: error["type"], message: reason)}
+    {:error, LangChainError.exception(type: error["type"], message: reason, original: response)}
   end
 
   def do_process_response(_model, {:error, %Jason.DecodeError{} = response}) do
@@ -868,29 +937,47 @@ defmodule LangChain.ChatModels.ChatAnthropic do
      LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
   end
 
-  def do_process_response(%ChatAnthropic{bedrock: %BedrockConfig{}}, %{
-        "message" => "Too many requests" <> _rest = message
-      }) do
+  def do_process_response(
+        %ChatAnthropic{bedrock: %BedrockConfig{}},
+        %{
+          "message" => "Too many requests" <> _rest = message
+        } = response
+      ) do
     # the error isn't wrapped in an error JSON object. tsk, tsk
-    {:error, LangChainError.exception(type: "too_many_requests", message: message)}
-  end
-
-  def do_process_response(%ChatAnthropic{bedrock: %BedrockConfig{}}, %{"message" => message}) do
-    {:error, LangChainError.exception(message: "Received error from API: #{message}")}
-  end
-
-  def do_process_response(%ChatAnthropic{bedrock: %BedrockConfig{}}, %{
-        bedrock_exception: exceptions
-      }) do
     {:error,
-     LangChainError.exception(message: "Stream exception received: #{inspect(exceptions)}")}
+     LangChainError.exception(type: "too_many_requests", message: message, original: response)}
+  end
+
+  def do_process_response(
+        %ChatAnthropic{bedrock: %BedrockConfig{}},
+        %{"message" => message} = response
+      ) do
+    {:error,
+     LangChainError.exception(message: "Received error from API: #{message}", original: response)}
+  end
+
+  def do_process_response(
+        %ChatAnthropic{bedrock: %BedrockConfig{}},
+        %{
+          bedrock_exception: exceptions
+        } = response
+      ) do
+    {:error,
+     LangChainError.exception(
+       message: "Stream exception received: #{inspect(exceptions)}",
+       original: response
+     )}
   end
 
   def do_process_response(_model, other) do
     Logger.error("Failed to process an unexpected response. #{inspect(other)}")
 
     {:error,
-     LangChainError.exception(type: "unexpected_response", message: "Unexpected response")}
+     LangChainError.exception(
+       type: "unexpected_response",
+       message: "Unexpected response",
+       original: other
+     )}
   end
 
   # for parsing a list of received content JSON objects
@@ -1057,6 +1144,10 @@ defmodule LangChain.ChatModels.ChatAnthropic do
 
     processed = Enum.filter(to_process, &relevant_event?/1)
 
+    if model.verbose_api do
+      IO.inspect(processed, label: "READY TO PROCESS")
+    end
+
     {processed, incomplete}
   end
 
@@ -1151,16 +1242,6 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   #   }
   # end
 
-  # Function support
-  def for_api(%Function{} = fun) do
-    # I'm here
-    %{
-      "name" => fun.name,
-      "input_schema" => get_parameters(fun)
-    }
-    |> Utils.conditionally_add_to_map("description", fun.description)
-  end
-
   # ToolCall support
   def for_api(%ToolCall{} = call) do
     %{
@@ -1173,25 +1254,27 @@ defmodule LangChain.ChatModels.ChatAnthropic do
 
   # ToolResult support
   def for_api(%ToolResult{} = result) do
-    case Keyword.fetch(result.options || [], :cache_control) do
-      :error ->
-        %{
-          "type" => "tool_result",
-          "tool_use_id" => result.tool_call_id,
-          "content" => result.content
-        }
-
-      {:ok, setting} ->
-        setting = if setting == true, do: @default_cache_control_block, else: setting
-
-        %{
-          "type" => "tool_result",
-          "tool_use_id" => result.tool_call_id,
-          "content" => result.content,
-          "cache_control" => setting
-        }
-    end
+    %{
+      "type" => "tool_result",
+      "tool_use_id" => result.tool_call_id,
+      "content" => content_parts_for_api(result.content)
+    }
     |> Utils.conditionally_add_to_map("is_error", result.is_error)
+    |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(result.options))
+  end
+
+  @doc """
+  Convert a Function to the format expected by the Anthropic API.
+  """
+  @spec function_for_api(Function.t()) :: map() | no_return()
+  def function_for_api(%Function{} = fun) do
+    # I'm here
+    %{
+      "name" => fun.name,
+      "input_schema" => get_parameters(fun)
+    }
+    |> Utils.conditionally_add_to_map("description", fun.description)
+    |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(fun.options))
   end
 
   @doc """
@@ -1265,6 +1348,27 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     ]
   end
 
+  # Get the cache control setting from the options.
+  #
+  # If the setting is true, return the default cache control block.
+  # If the setting is false, return nil.
+  # If the setting is a map, return the map.
+  #
+  # If the setting is not provided, return nil.
+  defp get_cache_control_setting(options) do
+    case Keyword.fetch(options || [], :cache_control) do
+      :error ->
+        nil
+
+      {:ok, setting} ->
+        if setting == true do
+          @default_cache_control_block
+        else
+          setting
+        end
+    end
+  end
+
   @doc """
   Converts a ContentPart to the format expected by the Anthropic API.
 
@@ -1293,14 +1397,8 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   """
   @spec content_part_for_api(ContentPart.t()) :: map() | nil | no_return()
   def content_part_for_api(%ContentPart{type: :text} = part) do
-    case Keyword.fetch(part.options || [], :cache_control) do
-      :error ->
-        %{"type" => "text", "text" => part.content}
-
-      {:ok, setting} ->
-        setting = if setting == true, do: @default_cache_control_block, else: setting
-        %{"type" => "text", "text" => part.content, "cache_control" => setting}
-    end
+    %{"type" => "text", "text" => part.content}
+    |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(part.options))
   end
 
   def content_part_for_api(%ContentPart{type: :thinking} = part) do
