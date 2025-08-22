@@ -538,6 +538,8 @@ defmodule LangChain.ChatModels.ChatAnthropic do
           IO.inspect(response, label: "RAW REQ RESPONSE")
         end
 
+        Callbacks.fire(anthropic.callbacks, :on_llm_response_headers, [response.headers])
+
         Callbacks.fire(anthropic.callbacks, :on_llm_ratelimit_info, [
           get_ratelimit_info(response.headers)
         ])
@@ -554,6 +556,8 @@ defmodule LangChain.ChatModels.ChatAnthropic do
 
       {:ok, %Req.Response{status: 429} = response} ->
         rate_limit_info = get_ratelimit_info(response.headers)
+
+        Callbacks.fire(anthropic.callbacks, :on_llm_response_headers, [response.headers])
 
         Callbacks.fire(anthropic.callbacks, :on_llm_ratelimit_info, [
           rate_limit_info
@@ -626,6 +630,8 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     )
     |> case do
       {:ok, %Req.Response{body: data} = response} ->
+        Callbacks.fire(anthropic.callbacks, :on_llm_response_headers, [response.headers])
+
         Callbacks.fire(anthropic.callbacks, :on_llm_ratelimit_info, [
           get_ratelimit_info(response.headers)
         ])
@@ -920,12 +926,12 @@ defmodule LangChain.ChatModels.ChatAnthropic do
           "error" => %{"type" => type, "message" => reason}
         } = response
       ) do
-    Logger.error("Received error from API: #{inspect(reason)}")
+    Logger.error("Received error from API: #{inspect(response)}")
     {:error, LangChainError.exception(type: type, message: reason, original: response)}
   end
 
   def do_process_response(_model, %{"error" => %{"message" => reason} = error} = response) do
-    Logger.error("Received error from API: #{inspect(reason)}")
+    Logger.error("Received error from API: #{inspect(response)}")
     {:error, LangChainError.exception(type: error["type"], message: reason, original: response)}
   end
 
